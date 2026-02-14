@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from . import TZ_NAME
 
@@ -43,11 +44,18 @@ class Event:
 
 
 class KarolAKvidoClient:
-    def __init__(self, timeout: int = 30) -> None:
-        self.timeout = timeout
+    def __init__(self, connect_timeout: float = 10.0, read_timeout: float = 30.0) -> None:
+        self.connect_timeout = connect_timeout
+        self.read_timeout = read_timeout
 
+    @retry(
+        retry=retry_if_exception_type(requests.RequestException),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        reraise=True,
+    )
     def fetch_text(self, url: str) -> str:
-        response = requests.get(url, timeout=self.timeout)
+        response = requests.get(url, timeout=(self.connect_timeout, self.read_timeout))
         response.raise_for_status()
         return response.text
 
