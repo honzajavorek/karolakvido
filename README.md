@@ -10,6 +10,7 @@ Malý program, který sleduje vystoupení [Karol a Kvído](https://karolakvido.c
 - V iCalendar exportu je datum akce správně vzhledem k tomu, že na webu je vše v časovém pásmu, které používá ČR.
 - V iCalendar exportu je vždy uvedena lokace, kde se akce koná.
 - V iCalendar exportu je v popisu akce uložen text, který je v sekci „Informace:“ na podstránce, a pod ním je v novém odstavci (volný řádek) odkaz na podstránku.
+- Pomocí GitHub Action se jednou týdně program sám spustí a vygeneruje export se všemi akcemi. Pak se spustí v tomtéž běhu ještě jednou a vygeneruje ještě export jen pro Prahu do souboru `karolakvido-praha.ics`. Soubory se uveřejní na internet pomocí GitHub Pages.
 
 ## Program
 
