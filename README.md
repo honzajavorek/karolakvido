@@ -2,6 +2,8 @@
 
 Malý program, který sleduje vystoupení [Karol a Kvído](https://karolakvido.cz/kalendar-koncertu/) a generuje soubor ve formátu iCalendar.
 
+_Vytvořeno za půl hodiny pomocí GPT-5.3-Codex, kód jsem neviděl._
+
 ## Funkce
 
 - Když se pustí `uv run karolakvido`, stáhne si https://karolakvido.cz/kalendar-koncertu/ a najde tam data o vystoupeních. URL je možné změnit přepínačem `--url`, ale výchozí hodnota je tato.
