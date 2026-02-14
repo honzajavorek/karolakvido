@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from . import TZ_NAME
+
+_LOG = logging.getLogger(__name__)
 
 _MONTHS = {
     "ledna": 1,
@@ -28,18 +32,74 @@ _MONTHS = {
 }
 
 _DATETIME_RE = re.compile(
-    r"(?P<day>\d{1,2})\.\s*(?P<month>[A-Za-zÁ-ž]+)\s*(?P<year>\d{4})[^\d]{1,20}(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?",
+    r"(?P<day>\d{1,2})\.\s*(?P<month>[A-Za-zÁ-ž]+)\s*(?P<year>\d{4})\s*,?\s*(?:(?:v|ve)\s*)?(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?(?:\s*hodin)?",
     re.IGNORECASE,
 )
 
 _DATETIME_WITHOUT_YEAR_RE = re.compile(
-    r"(?P<day>\d{1,2})\.\s*(?P<month>[A-Za-zÁ-ž]+)[^\d]{1,20}(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?",
+    r"(?P<day>\d{1,2})\.\s*(?P<month>[A-Za-zÁ-ž]+)\s*,?\s*(?:(?:v|ve)\s*)?(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?(?:\s*hodin)?",
     re.IGNORECASE,
 )
 
 _YEAR_RE = re.compile(r"\b(?P<year>20\d{2})\b")
 _NUMERIC_DATE_RE = re.compile(r"\b(?P<day>\d{1,2})\.(?P<month>\d{1,2})\.(?P<year>20\d{2})\b")
 _TIME_RE = re.compile(r"\b(?P<hour>\d{1,2})[:\.](?P<minute>\d{2})\b")
+
+
+def _should_retry_http_error(exc: BaseException) -> bool:
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+        return True
+
+    if isinstance(exc, requests.HTTPError):
+        response = exc.response
+        if response is None:
+            return False
+        return response.status_code == 429 or response.status_code >= 500
+
+    return False
+
+
+def _parse_retry_after_seconds(header_value: str | None) -> float | None:
+    if not header_value:
+        return None
+
+    value = header_value.strip()
+    if not value:
+        return None
+
+    if value.isdigit():
+        return float(value)
+
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=datetime.UTC)
+
+    seconds = (retry_at - datetime.now(datetime.UTC)).total_seconds()
+    if seconds <= 0:
+        return 0.0
+    return seconds
+
+
+def _wait_before_retry(retry_state) -> float:
+    default_wait = wait_exponential(multiplier=1, min=1, max=8)(retry_state)
+    if retry_state.outcome is None or not retry_state.outcome.failed:
+        return default_wait
+
+    exc = retry_state.outcome.exception()
+    if not isinstance(exc, requests.HTTPError) or exc.response is None:
+        return default_wait
+    if exc.response.status_code != 429:
+        return default_wait
+
+    retry_after = _parse_retry_after_seconds(exc.response.headers.get("Retry-After"))
+    if retry_after is None:
+        return default_wait
+
+    return max(default_wait, min(retry_after, 90.0))
 
 
 @dataclass(slots=True)
@@ -56,16 +116,25 @@ class KarolAKvidoClient:
     def __init__(self, connect_timeout: float = 10.0, read_timeout: float = 30.0) -> None:
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
+        self._session = requests.Session()
+        self._session.headers.update(
+            {
+                "User-Agent": "karolakvido-ics-export/0.1 (+https://github.com/honzajavorek/karolakvido)",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
+        )
 
     @retry(
-        retry=retry_if_exception_type(requests.RequestException),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=8),
+        retry=retry_if_exception(_should_retry_http_error),
+        stop=stop_after_attempt(5),
+        wait=_wait_before_retry,
         reraise=True,
     )
     def fetch_text(self, url: str) -> str:
-        response = requests.get(url, timeout=(self.connect_timeout, self.read_timeout))
+        _LOG.debug("HTTP GET %s", url)
+        response = self._session.get(url, timeout=(self.connect_timeout, self.read_timeout))
         response.raise_for_status()
+        _LOG.debug("HTTP %s pro %s", response.status_code, url)
         return response.text
 
     def parse_events(self, html: str, base_url: str) -> list[dict[str, str]]:
@@ -98,7 +167,14 @@ class KarolAKvidoClient:
         deduplicated: dict[str, dict[str, str]] = {}
         for event in events:
             deduplicated[event["detail_url"]] = event
-        return list(deduplicated.values())
+        deduplicated_events = list(deduplicated.values())
+        _LOG.info(
+            "Na stránce %s nalezeno %d kandidátů, po deduplikaci %d",
+            base_url,
+            len(events),
+            len(deduplicated_events),
+        )
+        return deduplicated_events
 
     def parse_detail(
         self,
@@ -124,8 +200,10 @@ class KarolAKvidoClient:
         )
 
     def collect_events(self, calendar_url: str) -> list[Event]:
+        _LOG.info("Stahuji hlavní kalendář %s", calendar_url)
         calendar_html = self.fetch_text(calendar_url)
         basic_events = self.parse_events(calendar_html, calendar_url)
+        _LOG.info("Zpracovávám detaily %d událostí", len(basic_events))
 
         events: list[Event] = []
         for basic in basic_events:
@@ -137,11 +215,18 @@ class KarolAKvidoClient:
                     basic["title"],
                     basic["city"] or None,
                 )
-            except (requests.RequestException, ValueError):
+            except (requests.RequestException, ValueError) as exc:
+                _LOG.warning(
+                    "Přeskakuji událost '%s' (%s): %s",
+                    basic["title"],
+                    basic["detail_url"],
+                    exc,
+                )
                 continue
             events.append(event)
 
         events.sort(key=lambda event: event.starts_at)
+        _LOG.info("Úspěšně zpracováno %d událostí", len(events))
         return events
 
     def _extract_title(self, soup: BeautifulSoup) -> str | None:
@@ -153,14 +238,16 @@ class KarolAKvidoClient:
         return None
 
     def _extract_datetime(self, soup: BeautifulSoup) -> datetime:
-        when_heading = soup.find(
+        when_headings = soup.find_all(
             lambda tag: isinstance(tag, Tag)
             and tag.name in {"h2", "h3"}
             and "kdy" in tag.get_text(" ", strip=True).lower()
         )
 
-        search_text = ""
-        if when_heading:
+        full_text = soup.get_text(" ", strip=True)
+
+        for when_heading in when_headings:
+            search_text = ""
             for sibling in when_heading.next_siblings:
                 if isinstance(sibling, Tag) and sibling.name in {"h2", "h3"}:
                     break
@@ -169,9 +256,9 @@ class KarolAKvidoClient:
                 elif isinstance(sibling, NavigableString):
                     search_text += " " + self._normalize_whitespace(str(sibling))
 
-        full_text = soup.get_text(" ", strip=True)
+            if not search_text:
+                continue
 
-        if search_text:
             when_dt = self._find_valid_datetime_with_year(search_text)
             if when_dt is not None:
                 return when_dt
@@ -310,18 +397,25 @@ class KarolAKvidoClient:
             return ""
 
         chunks: list[str] = []
-        for sibling in info_heading.next_siblings:
-            if isinstance(sibling, Tag) and sibling.name in {"h2", "h3"}:
-                break
-            if isinstance(sibling, Tag) and sibling.name in {"script", "style"}:
+        for node in info_heading.next_elements:
+            if node is info_heading:
                 continue
+            if isinstance(node, NavigableString) and node.parent is info_heading:
+                continue
+
+            if isinstance(node, Tag) and node.name in {"h2", "h3"}:
+                break
+            if isinstance(node, Tag) and node.name in {"script", "style"}:
+                continue
+
             text = ""
-            if isinstance(sibling, Tag):
-                text = sibling.get_text(" ", strip=True)
-            elif isinstance(sibling, NavigableString):
-                text = self._normalize_whitespace(str(sibling))
+            if isinstance(node, NavigableString):
+                text = self._normalize_whitespace(str(node))
 
             if not text:
+                continue
+            normalized = text.strip(" :").lower()
+            if normalized in {"informace", "vstupenky"}:
                 continue
             if "všechny akce karol a kvído" in text.lower():
                 break

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 import requests
@@ -9,6 +10,22 @@ import requests
 from karolakvido import DEFAULT_CALENDAR_URL, DEFAULT_OUTPUT_FILE, TZ_NAME
 from karolakvido.cli import main
 from karolakvido.scraper import Event, KarolAKvidoClient
+
+
+def _build_response(
+    *,
+    status_code: int,
+    url: str,
+    body: str = "",
+    headers: dict[str, str] | None = None,
+) -> requests.Response:
+    response = requests.Response()
+    response.status_code = status_code
+    response.url = url
+    response.request = requests.Request("GET", url).prepare()
+    response._content = body.encode("utf-8")
+    response.headers.update(headers or {})
+    return response
 
 
 def _sample_events() -> list[Event]:
@@ -151,6 +168,24 @@ def test_description_contains_info_and_link(
     ) in unfolded
 
 
+def test_description_includes_info_section_when_missing_info(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = _sample_events()
+    events[0].information_text = ""
+    monkeypatch.setattr(KarolAKvidoClient, "collect_events", lambda self, url: events)
+
+    output = tmp_path / "description-missing-info.ics"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.argv", ["karolakvido", "--output", str(output)])
+
+    main()
+
+    content = output.read_text(encoding="utf-8")
+    unfolded = content.replace("\r\n ", "").replace("\n ", "")
+    assert "DESCRIPTION:Neuvedeno\\n\\nhttps://karolakvido.cz/" in unfolded
+
+
 def test_parser_extracts_events_from_fixture(fixtures_dir: Path) -> None:
     client = KarolAKvidoClient()
     calendar_html = (fixtures_dir / "calendar_sample.html").read_text(encoding="utf-8")
@@ -167,6 +202,7 @@ def test_parser_extracts_events_from_fixture(fixtures_dir: Path) -> None:
     )
     assert event.location.startswith("Praha")
     assert "Program je vhodný" in event.information_text
+    assert not event.information_text.startswith("Informace:")
 
 
 def test_parser_falls_back_when_kdy_omits_year(fixtures_dir: Path) -> None:
@@ -221,6 +257,61 @@ def test_parser_prefers_kdy_over_related_events(fixtures_dir: Path) -> None:
     assert event.starts_at.month == 2
     assert event.starts_at.day == 14
     assert event.starts_at.hour == 15
+
+
+def test_parser_uses_nonempty_kdy_block_and_avoids_false_hour_from_full_text() -> None:
+    client = KarolAKvidoClient()
+    detail_html = """
+    <h1>Dobrodružství začíná 1. března 2026 Svitavy</h1>
+    <h2>Kdy:</h2>
+    <h2>Kde:</h2>
+    <p>Svitavy, Lidové divadlo</p>
+    <h2>Kdy:</h2>
+    <p>1. března 2026, v 16:00 hodin</p>
+    """
+
+    event = client.parse_detail(
+        detail_html,
+        "https://karolakvido.cz/akce_karol_a_kvido/dobrodruzstvi-zacina-1-brezna-2026-svitavy/",
+        "Dobrodružství začíná",
+        "Svitavy",
+    )
+
+    assert event.starts_at.year == 2026
+    assert event.starts_at.month == 3
+    assert event.starts_at.day == 1
+    assert event.starts_at.hour == 16
+    assert event.starts_at.minute == 0
+
+
+def test_parser_handles_kdy_with_time_without_v_prefix() -> None:
+        client = KarolAKvidoClient()
+        detail_html = """
+        <h1>Karol a Kvído v zoologické zahradě 7. listopadu 2026 Veselí nad Moravou</h1>
+        <h2>Kdy:</h2>
+        <p>7. listopadu 2026, 16:00 hodin</p>
+        <h2>Kde:</h2>
+        <p>Veselí nad Moravou, Kino Morava</p>
+        <h2>Informace:</h2>
+        <p>VSTUPENKY</p>
+        <h3>Všechny akce Karol a Kvído</h3>
+        <a href="/akce_karol_a_kvido/vanocni-pribeh-23-prosince-2026-ve-14-hodin-praha/">
+            Vánoční příběh 23. prosince 2026 ve 14 hodin Praha
+        </a>
+        """
+
+        event = client.parse_detail(
+                detail_html,
+                "https://karolakvido.cz/akce_karol_a_kvido/karol-a-kvido-v-zoologicke-zahrade-7-listopadu-2026-veseli-nad-moravou/",
+                "Karol a Kvído",
+                "Veselí nad Moravou",
+        )
+
+        assert event.starts_at.year == 2026
+        assert event.starts_at.month == 11
+        assert event.starts_at.day == 7
+        assert event.starts_at.hour == 16
+        assert event.starts_at.minute == 0
 
 
 def test_parser_handles_numeric_date_without_kdy(fixtures_dir: Path) -> None:
@@ -283,3 +374,88 @@ def test_collect_events_skips_unreachable_detail_pages(monkeypatch: pytest.Monke
 
     assert len(events) == 1
     assert events[0].detail_url == detail_ok
+
+
+def test_fetch_text_retries_on_http_429(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KarolAKvidoClient()
+    url = "https://example.com/kalendar"
+    responses = [
+        _build_response(status_code=429, url=url, headers={"Retry-After": "0"}),
+        _build_response(status_code=200, url=url, body="ok"),
+    ]
+    calls: list[tuple[str, Any]] = []
+
+    def fake_get(request_url: str, timeout: tuple[float, float]) -> requests.Response:
+        calls.append((request_url, timeout))
+        return responses.pop(0)
+
+    monkeypatch.setattr(client._session, "get", fake_get)
+    monkeypatch.setattr(KarolAKvidoClient.fetch_text.retry, "sleep", lambda _: None)
+
+    body = client.fetch_text(url)
+
+    assert body == "ok"
+    assert len(calls) == 2
+
+
+def test_fetch_text_does_not_retry_on_http_404(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KarolAKvidoClient()
+    url = "https://example.com/missing"
+    response_404 = _build_response(status_code=404, url=url)
+    calls: list[tuple[str, Any]] = []
+
+    def fake_get(request_url: str, timeout: tuple[float, float]) -> requests.Response:
+        calls.append((request_url, timeout))
+        return response_404
+
+    monkeypatch.setattr(client._session, "get", fake_get)
+    monkeypatch.setattr(KarolAKvidoClient.fetch_text.retry, "sleep", lambda _: None)
+
+    with pytest.raises(requests.HTTPError):
+        client.fetch_text(url)
+
+    assert len(calls) == 1
+
+
+def test_parser_extracts_information_when_not_direct_sibling() -> None:
+    client = KarolAKvidoClient()
+    detail_html = """
+    <h1>Akce A</h1>
+    <h2>Kdy:</h2><p>14. února 2026, v 10:00 hodin</p>
+    <h2>Kde:</h2><p>Praha, Divadlo</p>
+    <div><h2>Informace:</h2></div>
+    <div><p>Děti čeká hravý příběh.</p></div>
+    <h2>Všechny akce Karol a Kvído</h2>
+    """
+
+    event = client.parse_detail(
+        detail_html,
+        "https://karolakvido.cz/akce_karol_a_kvido/test/",
+        "Akce A",
+        "Praha",
+    )
+
+    assert "Děti čeká hravý příběh." in event.information_text
+
+
+def test_parser_ignores_vstupenky_label_in_information() -> None:
+    client = KarolAKvidoClient()
+    detail_html = """
+    <h1>Akce B</h1>
+    <h2>Kdy:</h2><p>14. února 2026, v 10:00 hodin</p>
+    <h2>Kde:</h2><p>Praha, Divadlo</p>
+    <h2>Informace:</h2>
+    <p>Skvělá show pro děti.</p>
+    <button>VSTUPENKY</button>
+    <h2>Všechny akce Karol a Kvído</h2>
+    """
+
+    event = client.parse_detail(
+        detail_html,
+        "https://karolakvido.cz/akce_karol_a_kvido/test-b/",
+        "Akce B",
+        "Praha",
+    )
+
+    assert "Skvělá show pro děti." in event.information_text
+    assert "VSTUPENKY" not in event.information_text

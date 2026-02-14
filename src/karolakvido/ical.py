@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 from . import TZ_NAME
 from .scraper import Event
+
+_LOG = logging.getLogger(__name__)
 
 
 def _escape_ics(value: str) -> str:
@@ -34,7 +37,13 @@ def _dtstamp_utc() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
+def _build_description(event: Event) -> str:
+    info_text = event.information_text.strip() or "Neuvedeno"
+    return f"{info_text}\n\n{event.detail_url}"
+
+
 def build_ics(events: list[Event]) -> str:
+    _LOG.info("Generuji ICS obsah pro %d událostí", len(events))
     lines: list[str] = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
@@ -46,7 +55,7 @@ def build_ics(events: list[Event]) -> str:
 
     for event in events:
         uid = f"{uuid5(NAMESPACE_URL, event.detail_url)}@karolakvido"
-        description = (event.information_text.strip() + "\n\n" + event.detail_url).strip()
+        description = _build_description(event)
 
         lines.extend(
             [
@@ -66,4 +75,7 @@ def build_ics(events: list[Event]) -> str:
 
 
 def write_ics(events: list[Event], output_path: Path) -> None:
+    _LOG.debug("Vytvářím adresář pro výstup: %s", output_path.parent)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(build_ics(events), encoding="utf-8")
+    _LOG.info("Soubor uložen: %s", output_path)
