@@ -378,6 +378,7 @@ def test_collect_events_skips_unreachable_detail_pages(monkeypatch: pytest.Monke
 
 def test_fetch_text_retries_on_http_429(monkeypatch: pytest.MonkeyPatch) -> None:
     client = KarolAKvidoClient()
+    client._sleep = lambda _: None
     url = "https://example.com/kalendar"
     responses = [
         _build_response(status_code=429, url=url, headers={"Retry-After": "0"}),
@@ -400,6 +401,7 @@ def test_fetch_text_retries_on_http_429(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_fetch_text_does_not_retry_on_http_404(monkeypatch: pytest.MonkeyPatch) -> None:
     client = KarolAKvidoClient()
+    client._sleep = lambda _: None
     url = "https://example.com/missing"
     response_404 = _build_response(status_code=404, url=url)
     calls: list[tuple[str, Any]] = []
@@ -436,6 +438,44 @@ def test_parser_extracts_information_when_not_direct_sibling() -> None:
     )
 
     assert "Děti čeká hravý příběh." in event.information_text
+
+
+def test_collect_events_retries_429_detail_until_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KarolAKvidoClient()
+    client._sleep = lambda _: None
+    calendar_url = "https://karolakvido.cz/kalendar-koncertu/"
+    detail_url = "https://karolakvido.cz/akce_karol_a_kvido/retry-me/"
+    calendar_html = """
+    <h3>Praha</h3>
+    <h5><a href=\"/akce_karol_a_kvido/retry-me/\">A</a></h5>
+    """
+    detail_html = """
+    <h1>Akce A</h1>
+    <h2>Kdy:</h2><p>14. února 2026, v 10:00 hodin</p>
+    <h2>Kde:</h2><p>Praha, Divadlo</p>
+    <h2>Informace:</h2><p>Info</p>
+    """
+    state = {"detail_calls": 0}
+
+    def fake_fetch(self: KarolAKvidoClient, url: str) -> str:
+        if url == calendar_url:
+            return calendar_html
+        if url != detail_url:
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        state["detail_calls"] += 1
+        if state["detail_calls"] == 1:
+            response = _build_response(status_code=429, url=detail_url, headers={"Retry-After": "0"})
+            raise requests.HTTPError("429", response=response)
+        return detail_html
+
+    monkeypatch.setattr(KarolAKvidoClient, "fetch_text", fake_fetch)
+
+    events = client.collect_events(calendar_url)
+
+    assert len(events) == 1
+    assert events[0].detail_url == detail_url
+    assert state["detail_calls"] == 2
 
 
 def test_parser_ignores_vstupenky_label_in_information() -> None:

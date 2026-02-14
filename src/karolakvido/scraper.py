@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from email.utils import parsedate_to_datetime
+from typing import Callable
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
@@ -113,9 +115,22 @@ class Event:
 
 
 class KarolAKvidoClient:
-    def __init__(self, connect_timeout: float = 10.0, read_timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        connect_timeout: float = 10.0,
+        read_timeout: float = 30.0,
+        request_delay: float = 1.0,
+        max_request_delay: float = 90.0,
+        adaptive_backoff_factor: float = 2.0,
+        sleep_fn: Callable[[float], None] = time.sleep,
+    ) -> None:
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
+        self.request_delay = max(0.0, request_delay)
+        self.max_request_delay = max(self.request_delay, max_request_delay)
+        self.adaptive_backoff_factor = max(1.0, adaptive_backoff_factor)
+        self._current_delay = self.request_delay
+        self._sleep = sleep_fn
         self._session = requests.Session()
         self._session.headers.update(
             {
@@ -124,6 +139,28 @@ class KarolAKvidoClient:
             }
         )
 
+    def _throttle_before_request(self, url: str) -> None:
+        if self._current_delay <= 0:
+            return
+
+        _LOG.debug("Čekám %.1f s před požadavkem na %s", self._current_delay, url)
+        self._sleep(self._current_delay)
+
+    def _increase_delay_after_429(self) -> None:
+        if self._current_delay <= 0:
+            self._current_delay = self.request_delay or 1.0
+        else:
+            self._current_delay *= self.adaptive_backoff_factor
+
+        self._current_delay = min(self._current_delay, self.max_request_delay)
+
+    def _relax_delay_after_success(self) -> None:
+        if self._current_delay <= self.request_delay:
+            self._current_delay = self.request_delay
+            return
+
+        self._current_delay = max(self.request_delay, self._current_delay * 0.9)
+
     @retry(
         retry=retry_if_exception(_should_retry_http_error),
         stop=stop_after_attempt(5),
@@ -131,9 +168,13 @@ class KarolAKvidoClient:
         reraise=True,
     )
     def fetch_text(self, url: str) -> str:
+        self._throttle_before_request(url)
         _LOG.debug("HTTP GET %s", url)
         response = self._session.get(url, timeout=(self.connect_timeout, self.read_timeout))
+        if response.status_code == 429:
+            self._increase_delay_after_429()
         response.raise_for_status()
+        self._relax_delay_after_success()
         _LOG.debug("HTTP %s pro %s", response.status_code, url)
         return response.text
 
@@ -207,23 +248,49 @@ class KarolAKvidoClient:
 
         events: list[Event] = []
         for basic in basic_events:
-            try:
-                detail_html = self.fetch_text(basic["detail_url"])
-                event = self.parse_detail(
-                    detail_html,
-                    basic["detail_url"],
-                    basic["title"],
-                    basic["city"] or None,
-                )
-            except (requests.RequestException, ValueError) as exc:
-                _LOG.warning(
-                    "Přeskakuji událost '%s' (%s): %s",
-                    basic["title"],
-                    basic["detail_url"],
-                    exc,
-                )
-                continue
-            events.append(event)
+            while True:
+                try:
+                    detail_html = self.fetch_text(basic["detail_url"])
+                    event = self.parse_detail(
+                        detail_html,
+                        basic["detail_url"],
+                        basic["title"],
+                        basic["city"] or None,
+                    )
+                    events.append(event)
+                    break
+                except requests.HTTPError as exc:
+                    response = exc.response
+                    status_code = response.status_code if response is not None else None
+                    if status_code == 429:
+                        self._increase_delay_after_429()
+                        retry_after = _parse_retry_after_seconds(response.headers.get("Retry-After"))
+                        wait_seconds = retry_after if retry_after is not None else self._current_delay
+                        wait_seconds = min(max(wait_seconds, self.request_delay), self.max_request_delay)
+                        _LOG.warning(
+                            "Událost '%s' (%s) vrátila 429, čekám %.1f s a zkouším znovu",
+                            basic["title"],
+                            basic["detail_url"],
+                            wait_seconds,
+                        )
+                        self._sleep(wait_seconds)
+                        continue
+
+                    _LOG.warning(
+                        "Přeskakuji událost '%s' (%s): %s",
+                        basic["title"],
+                        basic["detail_url"],
+                        exc,
+                    )
+                    break
+                except (requests.RequestException, ValueError) as exc:
+                    _LOG.warning(
+                        "Přeskakuji událost '%s' (%s): %s",
+                        basic["title"],
+                        basic["detail_url"],
+                        exc,
+                    )
+                    break
 
         events.sort(key=lambda event: event.starts_at)
         _LOG.info("Úspěšně zpracováno %d událostí", len(events))
