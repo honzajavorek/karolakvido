@@ -28,9 +28,18 @@ _MONTHS = {
 }
 
 _DATETIME_RE = re.compile(
-    r"(?P<day>\d{1,2})\.\s*(?P<month>[A-Za-zÁ-ž]+)\s*(?P<year>\d{4})[^\d]*(?P<hour>\d{1,2}):(?P<minute>\d{2})",
+    r"(?P<day>\d{1,2})\.\s*(?P<month>[A-Za-zÁ-ž]+)\s*(?P<year>\d{4})[^\d]{1,20}(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?",
     re.IGNORECASE,
 )
+
+_DATETIME_WITHOUT_YEAR_RE = re.compile(
+    r"(?P<day>\d{1,2})\.\s*(?P<month>[A-Za-zÁ-ž]+)[^\d]{1,20}(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?",
+    re.IGNORECASE,
+)
+
+_YEAR_RE = re.compile(r"\b(?P<year>20\d{2})\b")
+_NUMERIC_DATE_RE = re.compile(r"\b(?P<day>\d{1,2})\.(?P<month>\d{1,2})\.(?P<year>20\d{2})\b")
+_TIME_RE = re.compile(r"\b(?P<hour>\d{1,2})[:\.](?P<minute>\d{2})\b")
 
 
 @dataclass(slots=True)
@@ -120,15 +129,17 @@ class KarolAKvidoClient:
 
         events: list[Event] = []
         for basic in basic_events:
-            detail_html = self.fetch_text(basic["detail_url"])
-            events.append(
-                self.parse_detail(
+            try:
+                detail_html = self.fetch_text(basic["detail_url"])
+                event = self.parse_detail(
                     detail_html,
                     basic["detail_url"],
                     basic["title"],
                     basic["city"] or None,
                 )
-            )
+            except (requests.RequestException, ValueError):
+                continue
+            events.append(event)
 
         events.sort(key=lambda event: event.starts_at)
         return events
@@ -147,34 +158,120 @@ class KarolAKvidoClient:
             and tag.name in {"h2", "h3"}
             and "kdy" in tag.get_text(" ", strip=True).lower()
         )
+
         search_text = ""
         if when_heading:
             for sibling in when_heading.next_siblings:
                 if isinstance(sibling, Tag) and sibling.name in {"h2", "h3"}:
                     break
-                if isinstance(sibling, (Tag, NavigableString)):
+                if isinstance(sibling, Tag):
+                    search_text += " " + sibling.get_text(" ", strip=True)
+                elif isinstance(sibling, NavigableString):
                     search_text += " " + self._normalize_whitespace(str(sibling))
-        if not search_text:
-            search_text = soup.get_text(" ", strip=True)
 
-        match = _DATETIME_RE.search(search_text)
-        if not match:
-            raise ValueError("Nelze najít datum a čas akce.")
+        full_text = soup.get_text(" ", strip=True)
 
-        month_key = self._strip_diacritics(match.group("month")).lower()
-        month = _MONTHS.get(month_key)
-        if month is None:
-            raise ValueError(f"Neznámý měsíc: {match.group('month')}")
+        if search_text:
+            when_dt = self._find_valid_datetime_with_year(search_text)
+            if when_dt is not None:
+                return when_dt
 
-        dt = datetime(
-            int(match.group("year")),
-            month,
-            int(match.group("day")),
-            int(match.group("hour")),
-            int(match.group("minute")),
+            when_dt_without_year = self._find_valid_datetime_without_year(search_text, full_text)
+            if when_dt_without_year is not None:
+                return when_dt_without_year
+
+        fallback_dt = self._find_valid_datetime_with_year(full_text)
+        if fallback_dt is not None:
+            return fallback_dt
+
+        numeric_dt = self._find_valid_numeric_date(full_text)
+        if numeric_dt is not None:
+            return numeric_dt
+
+        raise ValueError("Nelze najít datum a čas akce.")
+
+    def _find_valid_datetime_with_year(self, text: str) -> datetime | None:
+        for match in _DATETIME_RE.finditer(text):
+            try:
+                return self._build_datetime(
+                    year=match.group("year"),
+                    month=match.group("month"),
+                    day=match.group("day"),
+                    hour=match.group("hour"),
+                    minute=match.group("minute") or "00",
+                )
+            except ValueError:
+                continue
+        return None
+
+    def _find_valid_datetime_without_year(self, text: str, full_text: str) -> datetime | None:
+        year_match = _YEAR_RE.search(full_text)
+        if not year_match:
+            return None
+
+        for match in _DATETIME_WITHOUT_YEAR_RE.finditer(text):
+            try:
+                return self._build_datetime(
+                    year=year_match.group("year"),
+                    month=match.group("month"),
+                    day=match.group("day"),
+                    hour=match.group("hour"),
+                    minute=match.group("minute") or "00",
+                )
+            except ValueError:
+                continue
+        return None
+
+    def _find_valid_numeric_date(self, full_text: str) -> datetime | None:
+        for match in _NUMERIC_DATE_RE.finditer(full_text):
+            day = int(match.group("day"))
+            month = int(match.group("month"))
+            year = int(match.group("year"))
+
+            hour = 0
+            minute = 0
+            window = full_text[match.end() : match.end() + 48]
+            time_match = _TIME_RE.search(window)
+            if time_match:
+                hour = int(time_match.group("hour"))
+                minute = int(time_match.group("minute"))
+
+            try:
+                return datetime(
+                    year,
+                    month,
+                    day,
+                    hour,
+                    minute,
+                    tzinfo=ZoneInfo(TZ_NAME),
+                )
+            except ValueError:
+                continue
+
+        return None
+
+    def _build_datetime(
+        self,
+        *,
+        year: str,
+        month: str,
+        day: str,
+        hour: str,
+        minute: str,
+    ) -> datetime:
+        month_key = self._strip_diacritics(month).lower()
+        month_number = _MONTHS.get(month_key)
+        if month_number is None:
+            raise ValueError(f"Neznámý měsíc: {month}")
+
+        return datetime(
+            int(year),
+            month_number,
+            int(day),
+            int(hour),
+            int(minute),
             tzinfo=ZoneInfo(TZ_NAME),
         )
-        return dt
 
     def _extract_location(self, soup: BeautifulSoup, city: str | None) -> str:
         where_heading = soup.find(

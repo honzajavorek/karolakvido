@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+import requests
 
 from karolakvido import DEFAULT_CALENDAR_URL, DEFAULT_OUTPUT_FILE, TZ_NAME
 from karolakvido.cli import main
@@ -168,6 +169,78 @@ def test_parser_extracts_events_from_fixture(fixtures_dir: Path) -> None:
     assert "Program je vhodný" in event.information_text
 
 
+def test_parser_falls_back_when_kdy_omits_year(fixtures_dir: Path) -> None:
+    client = KarolAKvidoClient()
+    detail_html = (fixtures_dir / "detail_missing_year_in_kdy.html").read_text(encoding="utf-8")
+
+    event = client.parse_detail(
+        detail_html,
+        "https://karolakvido.cz/akce_karol_a_kvido/piratsky-poklad-14-unora-v-15-hodin-praha/",
+        "Pirátský poklad",
+        "Praha",
+    )
+
+    assert event.starts_at.year == 2026
+    assert event.starts_at.month == 2
+    assert event.starts_at.day == 14
+    assert event.starts_at.hour == 15
+
+
+def test_parser_handles_time_without_minutes(fixtures_dir: Path) -> None:
+    client = KarolAKvidoClient()
+    detail_html = (fixtures_dir / "detail_without_minutes.html").read_text(encoding="utf-8")
+
+    event = client.parse_detail(
+        detail_html,
+        "https://karolakvido.cz/akce_karol_a_kvido/piratsky-poklad-14-unora-v-15-hodin-praha/",
+        "Pirátský poklad",
+        "Praha",
+    )
+
+    assert event.starts_at.year == 2026
+    assert event.starts_at.month == 2
+    assert event.starts_at.day == 14
+    assert event.starts_at.hour == 15
+    assert event.starts_at.minute == 0
+
+
+def test_parser_prefers_kdy_over_related_events(fixtures_dir: Path) -> None:
+    client = KarolAKvidoClient()
+    detail_html = (fixtures_dir / "detail_kdy_with_noisy_related_dates.html").read_text(
+        encoding="utf-8"
+    )
+
+    event = client.parse_detail(
+        detail_html,
+        "https://karolakvido.cz/akce_karol_a_kvido/piratsky-poklad-14-unora-v-15-hodin-praha/",
+        "Pirátský poklad",
+        "Praha",
+    )
+
+    assert event.starts_at.year == 2026
+    assert event.starts_at.month == 2
+    assert event.starts_at.day == 14
+    assert event.starts_at.hour == 15
+
+
+def test_parser_handles_numeric_date_without_kdy(fixtures_dir: Path) -> None:
+    client = KarolAKvidoClient()
+    detail_html = (fixtures_dir / "detail_numeric_date_without_kdy.html").read_text(
+        encoding="utf-8"
+    )
+
+    event = client.parse_detail(
+        detail_html,
+        "https://karolakvido.cz/karol-a-kvido-slavi-5-narozeniny/",
+        "Narozeninový koncert",
+        "Praha",
+    )
+
+    assert event.starts_at.year == 2026
+    assert event.starts_at.month == 8
+    assert event.starts_at.day == 22
+
+
 def test_live_snapshot_support(web_snapshot_loader) -> None:
     client = KarolAKvidoClient()
     calendar_html = web_snapshot_loader(
@@ -175,3 +248,38 @@ def test_live_snapshot_support(web_snapshot_loader) -> None:
     )
     events = client.parse_events(calendar_html, "https://karolakvido.cz/kalendar-koncertu/")
     assert events, "Na stránce kalendáře nebyly nalezeny žádné akce"
+
+
+def test_collect_events_skips_unreachable_detail_pages(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KarolAKvidoClient()
+    calendar_url = "https://karolakvido.cz/kalendar-koncertu/"
+    detail_ok = "https://karolakvido.cz/akce_karol_a_kvido/ok/"
+    detail_missing = "https://karolakvido.cz/akce_karol_a_kvido/missing/"
+
+    calendar_html = """
+    <h3>Praha</h3>
+    <h5><a href=\"/akce_karol_a_kvido/ok/\">A</a></h5>
+    <h5><a href=\"/akce_karol_a_kvido/missing/\">B</a></h5>
+    """
+    detail_ok_html = """
+    <h1>Akce A</h1>
+    <h2>Kdy:</h2><p>14. února 2026, v 10:00 hodin</p>
+    <h2>Kde:</h2><p>Praha, Divadlo</p>
+    <h2>Informace:</h2><p>Info</p>
+    """
+
+    def fake_fetch(self: KarolAKvidoClient, url: str) -> str:
+        if url == calendar_url:
+            return calendar_html
+        if url == detail_ok:
+            return detail_ok_html
+        if url == detail_missing:
+            raise requests.HTTPError("404")
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr(KarolAKvidoClient, "fetch_text", fake_fetch)
+
+    events = client.collect_events(calendar_url)
+
+    assert len(events) == 1
+    assert events[0].detail_url == detail_ok
