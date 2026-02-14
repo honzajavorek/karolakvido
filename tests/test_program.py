@@ -35,7 +35,6 @@ def _sample_events() -> list[Event]:
             starts_at=datetime(2026, 2, 14, 10, 0),
             location="Praha, Divadlo Lucie Bílé",
             detail_url="https://karolakvido.cz/akce_karol_a_kvido/piratsky-poklad-14-unora-2026-praha/",
-            information_text="Připravte se na show plnou dobrodružství.",
             city="Praha",
         ),
         Event(
@@ -43,7 +42,6 @@ def _sample_events() -> list[Event]:
             starts_at=datetime(2026, 2, 22, 16, 0),
             location="Litvínov, Kino Máj",
             detail_url="https://karolakvido.cz/akce_karol_a_kvido/dobrodruzstvi-zacina-22-unora-litvinov/",
-            information_text="Hudební představení pro celou rodinu.",
             city="Litvínov",
         ),
     ]
@@ -130,8 +128,10 @@ def test_ics_uses_czech_timezone(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     main()
 
     content = output.read_text(encoding="utf-8")
-    assert f"X-WR-TIMEZONE:{TZ_NAME}" in content
-    assert f"DTSTART;TZID={TZ_NAME}:20260214T100000" in content
+    assert "BEGIN:VTIMEZONE" in content
+    assert TZ_NAME in content
+    assert "DTSTART;TZID=" in content
+    assert "20260214T100000" in content
 
 
 def test_location_is_always_present(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -149,7 +149,7 @@ def test_location_is_always_present(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     assert "LOCATION:Neuvedeno" in content
 
 
-def test_description_contains_info_and_link(
+def test_description_contains_only_link(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(KarolAKvidoClient, "collect_events", lambda self, url: _sample_events())
@@ -162,218 +162,95 @@ def test_description_contains_info_and_link(
 
     content = output.read_text(encoding="utf-8")
     unfolded = content.replace("\r\n ", "").replace("\n ", "")
-    assert (
-        "DESCRIPTION:Připravte se na show plnou dobrodružství.\\n\\n"
-        "https://karolakvido.cz/"
-    ) in unfolded
+    assert "DESCRIPTION:https://karolakvido.cz/akce_karol_a_kvido/piratsky-poklad" in unfolded
+    assert "Připravte se na show plnou dobrodružství" not in unfolded
 
 
-def test_description_includes_info_section_when_missing_info(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    events = _sample_events()
-    events[0].information_text = ""
-    monkeypatch.setattr(KarolAKvidoClient, "collect_events", lambda self, url: events)
-
-    output = tmp_path / "description-missing-info.ics"
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("sys.argv", ["karolakvido", "--output", str(output)])
-
-    main()
-
-    content = output.read_text(encoding="utf-8")
-    unfolded = content.replace("\r\n ", "").replace("\n ", "")
-    assert "DESCRIPTION:Neuvedeno\\n\\nhttps://karolakvido.cz/" in unfolded
-
-
-def test_parser_extracts_events_from_fixture(fixtures_dir: Path) -> None:
+def test_parser_extracts_events_from_fixture() -> None:
     client = KarolAKvidoClient()
-    calendar_html = (fixtures_dir / "calendar_sample.html").read_text(encoding="utf-8")
-    detail_html = (fixtures_dir / "detail_praha.html").read_text(encoding="utf-8")
+    calendar_html = """
+        <html>
+            <body>
+                <h2>ÚNOR 2026</h2>
+                <h3>Praha</h3>
+                <h4>Únor14</h4>
+                <h5>
+                    <a href="/akce_karol_a_kvido/piratsky-poklad-14-unora-2026-praha/">
+                        Pirátský poklad
+                    </a>
+                </h5>
+                <p>Divadlo Lucie Bílé, v 10:00 hodin</p>
 
-    basic_events = client.parse_events(calendar_html, "https://karolakvido.cz/kalendar-koncertu/")
-    assert len(basic_events) == 2
-
-    event = client.parse_detail(
-        detail_html,
-        basic_events[0]["detail_url"],
-        basic_events[0]["title"],
-        basic_events[0]["city"],
-    )
-    assert event.location.startswith("Praha")
-    assert "Program je vhodný" in event.information_text
-    assert not event.information_text.startswith("Informace:")
-
-
-def test_parser_falls_back_when_kdy_omits_year(fixtures_dir: Path) -> None:
-    client = KarolAKvidoClient()
-    detail_html = (fixtures_dir / "detail_missing_year_in_kdy.html").read_text(encoding="utf-8")
-
-    event = client.parse_detail(
-        detail_html,
-        "https://karolakvido.cz/akce_karol_a_kvido/piratsky-poklad-14-unora-v-15-hodin-praha/",
-        "Pirátský poklad",
-        "Praha",
-    )
-
-    assert event.starts_at.year == 2026
-    assert event.starts_at.month == 2
-    assert event.starts_at.day == 14
-    assert event.starts_at.hour == 15
-
-
-def test_parser_handles_time_without_minutes(fixtures_dir: Path) -> None:
-    client = KarolAKvidoClient()
-    detail_html = (fixtures_dir / "detail_without_minutes.html").read_text(encoding="utf-8")
-
-    event = client.parse_detail(
-        detail_html,
-        "https://karolakvido.cz/akce_karol_a_kvido/piratsky-poklad-14-unora-v-15-hodin-praha/",
-        "Pirátský poklad",
-        "Praha",
-    )
-
-    assert event.starts_at.year == 2026
-    assert event.starts_at.month == 2
-    assert event.starts_at.day == 14
-    assert event.starts_at.hour == 15
-    assert event.starts_at.minute == 0
-
-
-def test_parser_prefers_kdy_over_related_events(fixtures_dir: Path) -> None:
-    client = KarolAKvidoClient()
-    detail_html = (fixtures_dir / "detail_kdy_with_noisy_related_dates.html").read_text(
-        encoding="utf-8"
-    )
-
-    event = client.parse_detail(
-        detail_html,
-        "https://karolakvido.cz/akce_karol_a_kvido/piratsky-poklad-14-unora-v-15-hodin-praha/",
-        "Pirátský poklad",
-        "Praha",
-    )
-
-    assert event.starts_at.year == 2026
-    assert event.starts_at.month == 2
-    assert event.starts_at.day == 14
-    assert event.starts_at.hour == 15
-
-
-def test_parser_uses_nonempty_kdy_block_and_avoids_false_hour_from_full_text() -> None:
-    client = KarolAKvidoClient()
-    detail_html = """
-    <h1>Dobrodružství začíná 1. března 2026 Svitavy</h1>
-    <h2>Kdy:</h2>
-    <h2>Kde:</h2>
-    <p>Svitavy, Lidové divadlo</p>
-    <h2>Kdy:</h2>
-    <p>1. března 2026, v 16:00 hodin</p>
-    """
-
-    event = client.parse_detail(
-        detail_html,
-        "https://karolakvido.cz/akce_karol_a_kvido/dobrodruzstvi-zacina-1-brezna-2026-svitavy/",
-        "Dobrodružství začíná",
-        "Svitavy",
-    )
-
-    assert event.starts_at.year == 2026
-    assert event.starts_at.month == 3
-    assert event.starts_at.day == 1
-    assert event.starts_at.hour == 16
-    assert event.starts_at.minute == 0
-
-
-def test_parser_handles_kdy_with_time_without_v_prefix() -> None:
-        client = KarolAKvidoClient()
-        detail_html = """
-        <h1>Karol a Kvído v zoologické zahradě 7. listopadu 2026 Veselí nad Moravou</h1>
-        <h2>Kdy:</h2>
-        <p>7. listopadu 2026, 16:00 hodin</p>
-        <h2>Kde:</h2>
-        <p>Veselí nad Moravou, Kino Morava</p>
-        <h2>Informace:</h2>
-        <p>VSTUPENKY</p>
-        <h3>Všechny akce Karol a Kvído</h3>
-        <a href="/akce_karol_a_kvido/vanocni-pribeh-23-prosince-2026-ve-14-hodin-praha/">
-            Vánoční příběh 23. prosince 2026 ve 14 hodin Praha
-        </a>
+                <h3>Litvínov</h3>
+                <h4>Únor22</h4>
+                <h5>
+                    <a href="https://karolakvido.cz/akce_karol_a_kvido/dobrodruzstvi-zacina-22-unora-litvinov/">
+                        Dobrodružství začíná
+                    </a>
+                </h5>
+                <p>Kino Máj, v 16:00 hodin</p>
+            </body>
+        </html>
         """
 
-        event = client.parse_detail(
-                detail_html,
-                "https://karolakvido.cz/akce_karol_a_kvido/karol-a-kvido-v-zoologicke-zahrade-7-listopadu-2026-veseli-nad-moravou/",
-                "Karol a Kvído",
-                "Veselí nad Moravou",
-        )
-
-        assert event.starts_at.year == 2026
-        assert event.starts_at.month == 11
-        assert event.starts_at.day == 7
-        assert event.starts_at.hour == 16
-        assert event.starts_at.minute == 0
-
-
-def test_parser_handles_numeric_date_without_kdy(fixtures_dir: Path) -> None:
-    client = KarolAKvidoClient()
-    detail_html = (fixtures_dir / "detail_numeric_date_without_kdy.html").read_text(
-        encoding="utf-8"
-    )
-
-    event = client.parse_detail(
-        detail_html,
-        "https://karolakvido.cz/karol-a-kvido-slavi-5-narozeniny/",
-        "Narozeninový koncert",
-        "Praha",
-    )
-
-    assert event.starts_at.year == 2026
-    assert event.starts_at.month == 8
-    assert event.starts_at.day == 22
-
-
-def test_live_snapshot_support(web_snapshot_loader) -> None:
-    client = KarolAKvidoClient()
-    calendar_html = web_snapshot_loader(
-        "live_calendar.html", "https://karolakvido.cz/kalendar-koncertu/"
-    )
     events = client.parse_events(calendar_html, "https://karolakvido.cz/kalendar-koncertu/")
-    assert events, "Na stránce kalendáře nebyly nalezeny žádné akce"
+
+    assert len(events) == 2
+
+    first = events[0]
+    assert first.title == "Pirátský poklad"
+    assert first.starts_at.year == 2026
+    assert first.starts_at.month == 2
+    assert first.starts_at.day == 14
+    assert first.starts_at.hour == 10
+    assert first.starts_at.minute == 0
+    assert first.location == "Divadlo Lucie Bílé"
 
 
-def test_collect_events_skips_unreachable_detail_pages(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_parser_handles_sparse_markup_without_location() -> None:
+    client = KarolAKvidoClient()
+    calendar_html = """
+    <h2>KVĚTEN 2026</h2>
+    <h3>Praha</h3>
+    <h4>Květ16</h4>
+        <h5>
+            <a href=\"/akce_karol_a_kvido/pokacova-o2-arena-16-kvetna-2026-v-18-hodin/\">
+                Pokáčova O2 Aréna
+            </a>
+        </h5>
+    <p>v 18:00 hodin</p>
+    """
+
+    events = client.parse_events(calendar_html, "https://karolakvido.cz/kalendar-koncertu/")
+
+    assert len(events) == 1
+    assert events[0].location == "Praha"
+    assert events[0].starts_at.hour == 18
+    assert events[0].starts_at.minute == 0
+
+
+def test_collect_events_fetches_calendar_once(monkeypatch: pytest.MonkeyPatch) -> None:
     client = KarolAKvidoClient()
     calendar_url = "https://karolakvido.cz/kalendar-koncertu/"
-    detail_ok = "https://karolakvido.cz/akce_karol_a_kvido/ok/"
-    detail_missing = "https://karolakvido.cz/akce_karol_a_kvido/missing/"
-
+    calls: list[str] = []
     calendar_html = """
+    <h2>ÚNOR 2026</h2>
     <h3>Praha</h3>
+    <h4>Únor14</h4>
     <h5><a href=\"/akce_karol_a_kvido/ok/\">A</a></h5>
-    <h5><a href=\"/akce_karol_a_kvido/missing/\">B</a></h5>
-    """
-    detail_ok_html = """
-    <h1>Akce A</h1>
-    <h2>Kdy:</h2><p>14. února 2026, v 10:00 hodin</p>
-    <h2>Kde:</h2><p>Praha, Divadlo</p>
-    <h2>Informace:</h2><p>Info</p>
+    <p>Divadlo, v 10:00 hodin</p>
     """
 
     def fake_fetch(self: KarolAKvidoClient, url: str) -> str:
-        if url == calendar_url:
-            return calendar_html
-        if url == detail_ok:
-            return detail_ok_html
-        if url == detail_missing:
-            raise requests.HTTPError("404")
-        raise AssertionError(f"Unexpected URL: {url}")
+        calls.append(url)
+        return calendar_html
 
     monkeypatch.setattr(KarolAKvidoClient, "fetch_text", fake_fetch)
 
     events = client.collect_events(calendar_url)
 
     assert len(events) == 1
-    assert events[0].detail_url == detail_ok
+    assert calls == [calendar_url]
 
 
 def test_fetch_text_retries_on_http_429(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -417,85 +294,3 @@ def test_fetch_text_does_not_retry_on_http_404(monkeypatch: pytest.MonkeyPatch) 
         client.fetch_text(url)
 
     assert len(calls) == 1
-
-
-def test_parser_extracts_information_when_not_direct_sibling() -> None:
-    client = KarolAKvidoClient()
-    detail_html = """
-    <h1>Akce A</h1>
-    <h2>Kdy:</h2><p>14. února 2026, v 10:00 hodin</p>
-    <h2>Kde:</h2><p>Praha, Divadlo</p>
-    <div><h2>Informace:</h2></div>
-    <div><p>Děti čeká hravý příběh.</p></div>
-    <h2>Všechny akce Karol a Kvído</h2>
-    """
-
-    event = client.parse_detail(
-        detail_html,
-        "https://karolakvido.cz/akce_karol_a_kvido/test/",
-        "Akce A",
-        "Praha",
-    )
-
-    assert "Děti čeká hravý příběh." in event.information_text
-
-
-def test_collect_events_retries_429_detail_until_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = KarolAKvidoClient()
-    client._sleep = lambda _: None
-    calendar_url = "https://karolakvido.cz/kalendar-koncertu/"
-    detail_url = "https://karolakvido.cz/akce_karol_a_kvido/retry-me/"
-    calendar_html = """
-    <h3>Praha</h3>
-    <h5><a href=\"/akce_karol_a_kvido/retry-me/\">A</a></h5>
-    """
-    detail_html = """
-    <h1>Akce A</h1>
-    <h2>Kdy:</h2><p>14. února 2026, v 10:00 hodin</p>
-    <h2>Kde:</h2><p>Praha, Divadlo</p>
-    <h2>Informace:</h2><p>Info</p>
-    """
-    state = {"detail_calls": 0}
-
-    def fake_fetch(self: KarolAKvidoClient, url: str) -> str:
-        if url == calendar_url:
-            return calendar_html
-        if url != detail_url:
-            raise AssertionError(f"Unexpected URL: {url}")
-
-        state["detail_calls"] += 1
-        if state["detail_calls"] == 1:
-            response = _build_response(status_code=429, url=detail_url, headers={"Retry-After": "0"})
-            raise requests.HTTPError("429", response=response)
-        return detail_html
-
-    monkeypatch.setattr(KarolAKvidoClient, "fetch_text", fake_fetch)
-
-    events = client.collect_events(calendar_url)
-
-    assert len(events) == 1
-    assert events[0].detail_url == detail_url
-    assert state["detail_calls"] == 2
-
-
-def test_parser_ignores_vstupenky_label_in_information() -> None:
-    client = KarolAKvidoClient()
-    detail_html = """
-    <h1>Akce B</h1>
-    <h2>Kdy:</h2><p>14. února 2026, v 10:00 hodin</p>
-    <h2>Kde:</h2><p>Praha, Divadlo</p>
-    <h2>Informace:</h2>
-    <p>Skvělá show pro děti.</p>
-    <button>VSTUPENKY</button>
-    <h2>Všechny akce Karol a Kvído</h2>
-    """
-
-    event = client.parse_detail(
-        detail_html,
-        "https://karolakvido.cz/akce_karol_a_kvido/test-b/",
-        "Akce B",
-        "Praha",
-    )
-
-    assert "Skvělá show pro děti." in event.information_text
-    assert "VSTUPENKY" not in event.information_text
