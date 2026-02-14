@@ -8,5 +8,5 @@ def test_workflow_contains_weekly_and_two_exports() -> None:
 
     assert 'cron: "0 6 * * 1"' in workflow
     assert "uv run karolakvido --output public/karolakvido.ics" in workflow
-    assert "uv run karolakvido --kraj Praha --output public/karolakvido-praha.ics" in workflow
+    assert "uv run karolakvido --region Praha --output public/karolakvido-praha.ics" in workflow
     assert "actions/deploy-pages@v4" in workflow

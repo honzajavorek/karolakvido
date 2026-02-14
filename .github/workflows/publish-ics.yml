@@ -20,14 +20,11 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v5
 
-      - name: Setup Python
-        run: uv python install 3.13
-
       - name: Generate calendars
         run: |
           mkdir -p public
           uv run karolakvido --output public/karolakvido.ics
-          uv run karolakvido --kraj Praha --output public/karolakvido-praha.ics
+          uv run karolakvido --region Praha --output public/karolakvido-praha.ics
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

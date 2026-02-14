@@ -17,18 +17,18 @@ def _parse_args() -> argparse.Namespace:
         help="Výstupní soubor .ics (relativně vůči aktuálnímu adresáři)",
     )
     parser.add_argument(
-        "--kraj",
+        "--region",
         default=None,
-        help="Filtr na kraj (prakticky textový filtr nad městem/lokací, např. Praha)",
+        help="Filtr na region (prakticky textový filtr nad městem/lokací, např. Praha)",
     )
     return parser.parse_args()
 
 
-def _filter_events(events: list[Event], kraj: str | None) -> list[Event]:
-    if not kraj:
+def _filter_events(events: list[Event], region: str | None) -> list[Event]:
+    if not region:
         return events
 
-    needle = kraj.casefold()
+    needle = region.casefold()
     filtered: list[Event] = []
     for event in events:
         haystacks = [event.location, event.city or "", event.title]
@@ -42,7 +42,7 @@ def main() -> int:
     client = KarolAKvidoClient()
 
     events = client.collect_events(args.url)
-    events = _filter_events(events, args.kraj)
+    events = _filter_events(events, args.region)
 
     output_path = Path(args.output)
     write_ics(events, output_path)

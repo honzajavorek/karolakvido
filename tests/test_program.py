@@ -87,12 +87,12 @@ def test_custom_output_path_is_written(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert output.exists()
 
 
-def test_filter_by_kraj(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_filter_by_region(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(KarolAKvidoClient, "collect_events", lambda self, url: _sample_events())
     output = tmp_path / "praha.ics"
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("sys.argv", ["karolakvido", "--kraj", "Praha", "--output", str(output)])
+    monkeypatch.setattr("sys.argv", ["karolakvido", "--region", "Praha", "--output", str(output)])
 
     main()
 
