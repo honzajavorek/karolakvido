@@ -21,7 +21,7 @@ jobs:
         uses: astral-sh/setup-uv@v5
 
       - name: Setup Python
-        run: uv python install 3.11
+        run: uv python install 3.13
 
       - name: Generate calendars
         run: |
